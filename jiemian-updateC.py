@@ -229,9 +229,16 @@ def compute_3d_data(sec_type, b, h, D, fc, fy, Es, cover, n_top, n_bot, n_side, 
     else:
         xf, yf = X_grid.flatten(), Y_grid.flatten()
         dA = (_section.b / nx) * (_section.h / ny)
-
-    alpha_angles = np.linspace(0, 2 * np.pi, 36)
-    c_values = np.append(np.logspace(np.log10(_section.h * 100), np.log10(1), 60), -1e-6)
+# 每15度计算一次
+    alpha_angles = np.linspace(0, 2 * np.pi, 25)  # 360/10 = 36 intervals, 25 points to include 360
+    # 更加精细的中性轴深度采样，涵盖从纯压到纯拉的完整过程
+    c_values = np.concatenate([
+        np.logspace(np.log10(_section.h * 100), np.log10(_section.h), 20), # 超深中性轴（接近纯压）
+        np.linspace(_section.h, 0.1 * _section.h, 40),                     # 截面内中性轴（受压控制到受拉控制）
+        np.logspace(np.log10(0.1 * _section.h), np.log10(1), 20),          # 极浅中性轴（接近纯弯）
+        [-1e-6]                                                            # 负无穷深（纯拉）
+    ])
+    c_values = np.unique(c_values)[::-1] # 降序排列并去重
 
     Pn_mesh, Mnx_mesh, Mny_mesh = (np.zeros((len(c_values), len(alpha_angles))) for _ in range(3))
     Pd_mesh, Mdx_mesh, Mdy_mesh = (np.zeros((len(c_values), len(alpha_angles))) for _ in range(3))
@@ -284,7 +291,7 @@ def compute_3d_data(sec_type, b, h, D, fc, fy, Es, cover, n_top, n_bot, n_side, 
             Pn_mesh[i, j], Mnx_mesh[i, j], Mny_mesh[i, j] = Pn / 1000, Mnx / 1e6, Mny / 1e6
             Pd_mesh[i, j], Mdx_mesh[i, j], Mdy_mesh[i, j] = Pd_plot / 1000, Mdx_plot / 1e6, Mdy_plot / 1e6
 
-    return Pn_mesh, Mnx_mesh, Mny_mesh, Pd_mesh, Mdx_mesh, Mdy_mesh
+    return Pn_mesh, Mnx_mesh, Mny_mesh, Pd_mesh, Mdx_mesh, Mdy_mesh, c_values, alpha_angles
 
 
 # =====================================================================
@@ -501,6 +508,10 @@ with st.sidebar:
     uploaded_file = st.file_uploader("或导入 ETABS 内力 CSV 文件", type=['csv'])
     run_btn = st.button("🚀 开始分析与验算", use_container_width=True, type="primary")
 
+# 初始化 session_state 用于缓存计算结果
+if 'calc_results' not in st.session_state:
+    st.session_state.calc_results = None
+
 if run_btn:
     with st.spinner("正在进行核心计算与多维空间映射..."):
         sec = RCSection('矩形' if '矩形' in sec_type else '圆形', b, h, D, fc, fy, 200000.0, cover, int(n_top),
@@ -540,272 +551,353 @@ if run_btn:
                 st.error(f"文件解析失败: {e}")
 
         df_demands = pd.DataFrame(demands_list)
-        max_N_val = df_demands['P'].max()
-        min_N_val = df_demands['P'].min()
+        
+        if engine_mode == "3D PMM 曲面":
+            Pn_mesh, Mnx_mesh, Mny_mesh, Pd_mesh, Mdx_mesh, Mdy_mesh, c_values, alpha_angles = compute_3d_data(
+                sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top), int(n_bot), int(n_side), int(n_circ),
+                d_bar, has_steel, hs, bs, tw, tf, fya)
 
-        # ================== 左侧固定展示区：截面预览 ==================
-        col_res1, col_res2 = st.columns([1, 4])
-        with col_res1:
-            fig_sec, ax_sec = plt.subplots(figsize=(4, 5))
-            if sec.sec_type == '矩形':
-                ax_sec.plot([-sec.b / 2, sec.b / 2, sec.b / 2, -sec.b / 2, -sec.b / 2],
-                            [sec.h / 2, sec.h / 2, -sec.h / 2, -sec.h / 2, sec.h / 2], 'k-', linewidth=2.5)
-            else:
-                theta = np.linspace(0, 2 * np.pi, 100)
-                ax_sec.plot(sec.D / 2 * np.cos(theta), sec.D / 2 * np.sin(theta), 'k-', linewidth=2.5)
+            df_demands[['D/C (3D Radial)', 'Req_Len', 'Cap_Len']] = df_demands.apply(
+                lambda row: pd.Series(
+                    calc_3d_radial_dc(row['P'], row['Mx'], row['My'], alpha_angles, Pd_mesh, Mdx_mesh, Mdy_mesh)),
+                axis=1)
 
-            ax_sec.scatter(sec.xs_coords, sec.ys_coords, s=90, c='red', zorder=5)
+            max_dc_3d = df_demands['D/C (3D Radial)'].max()
+            critical_row = df_demands.loc[df_demands['D/C (3D Radial)'].idxmax()]
+            
+            _, _, Pd_x, Mdx_x = compute_2d_pm_strict(sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top),
+                                                     int(n_bot), int(n_side), int(n_circ), d_bar, has_steel, hs,
+                                                     bs, tw, tf, fya, 'fiber', 'X')
+            _, _, Pd_y, Mdy_y = compute_2d_pm_strict(sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top),
+                                                     int(n_bot), int(n_side), int(n_circ), d_bar, has_steel, hs,
+                                                     bs, tw, tf, fya, 'fiber', 'Y')
+            df_demands['D/C (Bresler)'] = df_demands.apply(
+                lambda row: calc_bresler_dc(row['P'], row['Mx'], row['My'], sec.Pd_max / 1000, Pd_x, Mdx_x,
+                                            Pd_y, Mdy_y), axis=1)
 
-            if has_steel:
-                h_poly = [-bs / 2, bs / 2, bs / 2, tw / 2, tw / 2, bs / 2, bs / 2, -bs / 2, -bs / 2, -tw / 2, -tw / 2,
-                          -bs / 2, -bs / 2]
-                v_poly = [hs / 2, hs / 2, hs / 2 - tf, hs / 2 - tf, -hs / 2 + tf, -hs / 2 + tf, -hs / 2, -hs / 2,
-                          -hs / 2 + tf, -hs / 2 + tf, hs / 2 - tf, hs / 2 - tf, hs / 2]
-                ax_sec.plot(h_poly, v_poly, 'b-', linewidth=2)
-                ax_sec.fill(h_poly, v_poly, 'blue', alpha=0.25)
+            st.session_state.calc_results = {
+                'engine': '3D', 'sec': sec, 'df_demands': df_demands,
+                'Pn_mesh': Pn_mesh, 'Mnx_mesh': Mnx_mesh, 'Mny_mesh': Mny_mesh,
+                'Pd_mesh': Pd_mesh, 'Mdx_mesh': Mdx_mesh, 'Mdy_mesh': Mdy_mesh,
+                'c_values': c_values, 'alpha_angles': alpha_angles,
+                'max_dc_3d': max_dc_3d, 'critical_row': critical_row,
+                'Pd_x': Pd_x, 'Mdx_x': Mdx_x, 'Pd_y': Pd_y, 'Mdy_y': Mdy_y
+            }
+        else:
+            method = 'stress_block' if '等效应力块' in engine_mode else 'fiber'
+            Pn_x, Mn_x, Pd_x, Md_x = compute_2d_pm_strict(
+                sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top), int(n_bot), int(n_side), int(n_circ),
+                d_bar, has_steel, hs, bs, tw, tf, fya, method, bending_axis='X')
+            Pn_y, Mn_y, Pd_y, Md_y = compute_2d_pm_strict(
+                sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top), int(n_bot), int(n_side), int(n_circ),
+                d_bar, has_steel, hs, bs, tw, tf, fya, method, bending_axis='Y')
+            st.session_state.calc_results = {
+                'engine': '2D', 'sec': sec, 'df_demands': df_demands,
+                'Pn_x': Pn_x, 'Mn_x': Mn_x, 'Pd_x': Pd_x, 'Md_x': Md_x,
+                'Pn_y': Pn_y, 'Mn_y': Mn_y, 'Pd_y': Pd_y, 'Md_y': Md_y,
+                'method': method
+            }
 
-            ax_sec.set_aspect('equal');
-            ax_sec.axis('off')
-            ax_sec.set_title(
-                f"Section Preview\nAs={sec.Ast_total:.0f} mm²" + (f", Aa={sec.A_steel:.0f} mm²" if has_steel else ""),
-                fontsize=12, pad=15)
-            st.pyplot(fig_sec)
+if st.session_state.calc_results is not None:
+    res = st.session_state.calc_results
+    sec = res['sec']
+    df_demands = res['df_demands']
+    max_N_val = df_demands['P'].max()
+    min_N_val = df_demands['P'].min()
 
-            st.info(
-                f"**总含钢率**: {((sec.Ast_total + sec.A_steel) / sec.Ag) * 100:.2f}%\n\n**理论最大轴压 $P_o$**: {sec.Po / 1000:.1f} kN\n\n**设计最大轴压 $N_{{u,max}}$**: {sec.Pd_max / 1000:.1f} kN")
+    # ================== 左侧固定展示区：截面预览 ==================
+    col_res1, col_res2 = st.columns([1, 4])
+    with col_res1:
+        fig_sec, ax_sec = plt.subplots(figsize=(4, 5))
+        if sec.sec_type == '矩形':
+            ax_sec.plot([-sec.b / 2, sec.b / 2, sec.b / 2, -sec.b / 2, -sec.b / 2],
+                        [sec.h / 2, sec.h / 2, -sec.h / 2, -sec.h / 2, sec.h / 2], 'k-', linewidth=2.5)
+        else:
+            theta = np.linspace(0, 2 * np.pi, 100)
+            ax_sec.plot(sec.D / 2 * np.cos(theta), sec.D / 2 * np.sin(theta), 'k-', linewidth=2.5)
 
-        # ================== 右侧动态页签区 ==================
-        with col_res2:
-            if engine_mode == "3D PMM 曲面":
-                Pn_mesh, Mnx_mesh, Mny_mesh, Pd_mesh, Mdx_mesh, Mdy_mesh = compute_3d_data(
-                    sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top), int(n_bot), int(n_side), int(n_circ),
-                    d_bar, has_steel, hs, bs, tw, tf, fya)
+        ax_sec.scatter(sec.xs_coords, sec.ys_coords, s=90, c='red', zorder=5)
 
-                alpha_angles = np.linspace(0, 2 * np.pi, 36)
-                df_demands[['D/C (3D Radial)', 'Req_Len', 'Cap_Len']] = df_demands.apply(
-                    lambda row: pd.Series(
-                        calc_3d_radial_dc(row['P'], row['Mx'], row['My'], alpha_angles, Pd_mesh, Mdx_mesh, Mdy_mesh)),
-                    axis=1)
+        if sec.has_steel:
+            h_poly = [-sec.bs / 2, sec.bs / 2, sec.bs / 2, sec.tw / 2, sec.tw / 2, sec.bs / 2, sec.bs / 2, -sec.bs / 2, -sec.bs / 2, -sec.tw / 2, -sec.tw / 2,
+                      -sec.bs / 2, -sec.bs / 2]
+            v_poly = [sec.hs / 2, sec.hs / 2, sec.hs / 2 - sec.tf, sec.hs / 2 - sec.tf, -sec.hs / 2 + sec.tf, -sec.hs / 2 + sec.tf, -sec.hs / 2, -sec.hs / 2,
+                      -sec.hs / 2 + sec.tf, -sec.hs / 2 + sec.tf, sec.hs / 2 - sec.tf, sec.hs / 2 - sec.tf, sec.hs / 2]
+            ax_sec.plot(h_poly, v_poly, 'b-', linewidth=2)
+            ax_sec.fill(h_poly, v_poly, 'blue', alpha=0.25)
 
-                max_dc_3d = df_demands['D/C (3D Radial)'].max()
-                critical_row = df_demands.loc[df_demands['D/C (3D Radial)'].idxmax()]
+        ax_sec.set_aspect('equal');
+        ax_sec.axis('off')
+        ax_sec.set_title(
+            f"Section Preview\nAs={sec.Ast_total:.0f} mm²" + (f", Aa={sec.A_steel:.0f} mm²" if sec.has_steel else ""),
+            fontsize=12, pad=15)
+        st.pyplot(fig_sec)
 
-                tab1, tab2, tab3, tab4, tab5 = st.tabs(
-                    ["📊 3D 曲面与主轴切片", "🎯 极值轴力 Mx-My 切片验算", "📋 Bresler 验算报告单", "🗄️ PMM 曲面数据输出",
-                     "📄 计算书输出 (Report)"])
+        st.info(
+            f"**总含钢率**: {((sec.Ast_total + sec.A_steel) / sec.Ag) * 100:.2f}%\n\n**理论最大轴压 $P_o$**: {sec.Po / 1000:.1f} kN\n\n**设计最大轴压 $N_{{u,max}}$**: {sec.Pd_max / 1000:.1f} kN")
 
-                with tab1:
-                    col_3d, col_dc = st.columns([3, 1])
-                    with col_3d:
-                        fig_3d = plt.figure(figsize=(10, 8))
-                        ax_3d = fig_3d.add_subplot(111, projection='3d')
-                        ax_3d.plot_surface(Mnx_mesh, Mny_mesh, Pn_mesh, color='cyan', edgecolor='c', linewidth=0.1,
-                                           alpha=0.15)
-                        ax_3d.plot_surface(Mdx_mesh, Mdy_mesh, Pd_mesh, color='red', edgecolor='darkred', linewidth=0.3,
-                                           alpha=0.7)
+    # ================== 右侧动态页签区 ==================
+    with col_res2:
+        if res['engine'] == "3D":
+            Pn_mesh, Mnx_mesh, Mny_mesh, Pd_mesh, Mdx_mesh, Mdy_mesh = res['Pn_mesh'], res['Mnx_mesh'], res['Mny_mesh'], res['Pd_mesh'], res['Mdx_mesh'], res['Mdy_mesh']
+            c_values, alpha_angles, max_dc_3d, critical_row = res['c_values'], res['alpha_angles'], res['max_dc_3d'], res['critical_row']
+            Pd_x, Mdx_x, Pd_y, Mdy_y = res['Pd_x'], res['Mdx_x'], res['Pd_y'], res['Mdy_y']
 
-                        ax_3d.scatter(df_demands['Mx'], df_demands['My'], df_demands['P'], color='black', s=40,
-                                      marker='x', label='Demands (Pu, Mux, Muy)', zorder=10)
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(
+                ["📊 3D 曲面与主轴切片", "🎯 极值轴力 Mx-My 切片验算", "📋 Bresler 验算报告单", "🗄️ PMM 曲面数据输出",
+                 "📄 计算书输出 (Report)"])
 
-                        ax_3d.set_title('3D P-Mx-My Interaction Surface', fontsize=15)
-                        ax_3d.set_xlabel('Mx (kN·m)');
-                        ax_3d.set_ylabel('My (kN·m)');
-                        ax_3d.set_zlabel('P (kN)')
-                        nom_patch = mpatches.Patch(color='cyan', alpha=0.3, label='Theoretical Nominal ($P_o$)')
-                        des_patch = mpatches.Patch(color='red', alpha=0.7, label='Design ($\phi P_n$, Capped)')
-                        ax_3d.legend(handles=[nom_patch, des_patch], loc='upper left')
-                        ax_3d.view_init(elev=20, azim=40)
-                        st.pyplot(fig_3d)
+            with tab1:
+                col_3d, col_dc = st.columns([3, 1])
+                with col_3d:
+                    fig_3d = plt.figure(figsize=(10, 8))
+                    ax_3d = fig_3d.add_subplot(111, projection='3d')
+                    ax_3d.plot_surface(Mnx_mesh, Mny_mesh, Pn_mesh, color='cyan', edgecolor='c', linewidth=0.1,
+                                       alpha=0.15)
+                    ax_3d.plot_surface(Mdx_mesh, Mdy_mesh, Pd_mesh, color='red', edgecolor='darkred', linewidth=0.3,
+                                       alpha=0.7)
 
-                    with col_dc:
-                        st.markdown("<br><br>", unsafe_allow_html=True)
-                        st.markdown(f"""
-                        <div style="background-color:#f0f6ff; padding:20px; border-radius:10px; margin-bottom:15px;">
-                            <p style="color:#004085; font-size:16px; font-weight:bold; margin-bottom:5px;">最高 3D D/C Ratio:</p>
-                            <h1 style="color:#0056b3; margin-top:0px;">{max_dc_3d:.3f}</h1>
-                        </div>
-                        """, unsafe_allow_html=True)
+                    ax_3d.scatter(df_demands['Mx'], df_demands['My'], df_demands['P'], color='black', s=40,
+                                  marker='x', label='Demands (Pu, Mux, Muy)', zorder=10)
 
-                        if max_dc_3d <= 1.0:
-                            st.markdown(
-                                """<div style="background-color:#e6f4ea; padding:15px; border-radius:10px; color:#1e7e34; font-weight:bold;">✅ 截面安全</div>""",
-                                unsafe_allow_html=True)
+                    ax_3d.set_title('3D P-Mx-My Interaction Surface', fontsize=15)
+                    ax_3d.set_xlabel('Mx (kN·m)');
+                    ax_3d.set_ylabel('My (kN·m)');
+                    ax_3d.set_zlabel('P (kN)')
+                    nom_patch = mpatches.Patch(color='cyan', alpha=0.3, label='Theoretical Nominal ($P_o$)')
+                    des_patch = mpatches.Patch(color='red', alpha=0.7, label='Design ($\phi P_n$, Capped)')
+                    ax_3d.legend(handles=[nom_patch, des_patch], loc='upper left')
+                    ax_3d.view_init(elev=20, azim=40)
+                    st.pyplot(fig_3d)
+
+                with col_dc:
+                    st.markdown("<br><br>", unsafe_allow_html=True)
+                    st.markdown(f"""
+                    <div style="background-color:#f0f6ff; padding:20px; border-radius:10px; margin-bottom:15px;">
+                        <p style="color:#004085; font-size:16px; font-weight:bold; margin-bottom:5px;">最高 3D D/C Ratio:</p>
+                        <h1 style="color:#0056b3; margin-top:0px;">{max_dc_3d:.3f}</h1>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    if max_dc_3d <= 1.0:
+                        st.markdown(
+                            """<div style="background-color:#e6f4ea; padding:15px; border-radius:10px; color:#1e7e34; font-weight:bold;">✅ 截面安全</div>""",
+                            unsafe_allow_html=True)
+                    else:
+                        st.markdown(
+                            """<div style="background-color:#fce8e6; padding:15px; border-radius:10px; color:#c5221f; font-weight:bold;">❌ 截面不安全</div>""",
+                            unsafe_allow_html=True)
+
+                    st.markdown("<hr>", unsafe_allow_html=True)
+                    st.markdown("**最不利工况 Radial 数据：**")
+                    st.write(f"工况名: {critical_row['LoadCombo']}")
+                    st.write(f"分子 (Demand Vector): **{critical_row['Req_Len']:.1f}**")
+                    st.write(f"分母 (Capacity Vector): **{critical_row['Cap_Len']:.1f}**")
+
+                st.markdown("<br>", unsafe_allow_html=True)
+                col_s1, col_s2, col_s3 = st.columns(3)
+
+
+                def extract_2d_slice(alpha_deg):
+                    n_alpha = len(alpha_angles) - 1 # np.linspace(0, 2pi, 25) means 24 intervals
+                    idx_pos = int((alpha_deg / 360.0) * n_alpha);
+                    idx_neg = int(((alpha_deg + 180) / 360.0) * n_alpha) % n_alpha
+                    Mres_n_nom = np.sqrt(Mnx_mesh[:, idx_neg] ** 2 + Mny_mesh[:, idx_neg] ** 2) * -1
+                    Mres_p_nom = np.sqrt(Mnx_mesh[:, idx_pos] ** 2 + Mny_mesh[:, idx_pos] ** 2)
+                    Mres_n_des = np.sqrt(Mdx_mesh[:, idx_neg] ** 2 + Mdy_mesh[:, idx_neg] ** 2) * -1
+                    Mres_p_des = np.sqrt(Mdx_mesh[:, idx_pos] ** 2 + Mdy_mesh[:, idx_pos] ** 2)
+                    return (np.concatenate([Mres_n_nom[::-1], Mres_p_nom]),
+                            np.concatenate([Pn_mesh[:, idx_neg][::-1], Pn_mesh[:, idx_pos]]),
+                            np.concatenate([Mres_n_des[::-1], Mres_p_des]),
+                            np.concatenate([Pd_mesh[:, idx_neg][::-1], Pd_mesh[:, idx_pos]]))
+
+
+                for col, ang, title, m_col in zip([col_s1, col_s2, col_s3], [0, 90, custom_alpha],
+                                                  ['Slice @ 0° (P-Mx)', 'Slice @ 90° (P-My)',
+                                                   f'Slice @ {custom_alpha}° (P-M$\\alpha$)'],
+                                                  ['Mx', 'My', None]):
+                    with col:
+                        fig_sl = plt.figure(figsize=(6, 5))
+                        ax_sl = fig_sl.add_subplot(111)
+                        M_nom, P_nom, M_des, P_des = extract_2d_slice(ang)
+                        ax_sl.plot(M_nom, P_nom, 'c-.', linewidth=2, label='Nominal')
+                        ax_sl.plot(M_des, P_des, 'r-', linewidth=2, label='Design')
+
+                        if m_col == 'Mx':
+                            ax_sl.scatter(df_demands['Mx'], df_demands['P'], color='black', s=25, marker='x',
+                                          zorder=5)
+                        elif m_col == 'My':
+                            ax_sl.scatter(df_demands['My'], df_demands['P'], color='black', s=25, marker='x',
+                                          zorder=5)
                         else:
-                            st.markdown(
-                                """<div style="background-color:#fce8e6; padding:15px; border-radius:10px; color:#c5221f; font-weight:bold;">❌ 截面不安全</div>""",
-                                unsafe_allow_html=True)
+                            a_rad = np.radians(custom_alpha)
+                            m_proj = df_demands['Mx'] * np.cos(a_rad) + df_demands['My'] * np.sin(a_rad)
+                            ax_sl.scatter(m_proj, df_demands['P'], color='black', s=25, marker='x', zorder=5)
 
-                        st.markdown("<hr>", unsafe_allow_html=True)
-                        st.markdown("**最不利工况 Radial 数据：**")
-                        st.write(f"工况名: {critical_row['LoadCombo']}")
-                        st.write(f"分子 (Demand Vector): **{critical_row['Req_Len']:.1f}**")
-                        st.write(f"分母 (Capacity Vector): **{critical_row['Cap_Len']:.1f}**")
+                        ax_sl.axhline(0, color='k', linewidth=0.8);
+                        ax_sl.axvline(0, color='k', linewidth=0.8)
+                        ax_sl.axhline(sec.Po / 1000, color='cyan', linestyle=':', alpha=0.6);
+                        ax_sl.axhline(sec.Pd_max / 1000, color='red', linestyle=':', alpha=0.6)
+                        ax_sl.set_title(title, fontsize=12);
+                        ax_sl.set_xlabel('Moment (kN·m)');
+                        ax_sl.set_ylabel('Axial (kN)')
+                        ax_sl.grid(True, linestyle=':', alpha=0.7);
+                        ax_sl.legend(fontsize=9)
+                        st.pyplot(fig_sl)
 
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    col_s1, col_s2, col_s3 = st.columns(3)
+            with tab2:
+                st.subheader("🎯 恒定轴力 Mx-My 等高线切片 (Constant Load Contour)")
+                st.write("利用水平截面截取 3D 曲面，得到在指定轴向力 $P_u$ 下的双向抗弯闭合曲线。")
+                col_p1, col_p2, col_p3 = st.columns(3)
+                eval_N_list = [("User Input N", target_N, col_p1), ("Max N in Demands", max_N_val, col_p2),
+                               ("Min N in Demands", min_N_val, col_p3)]
+                max_N_des = sec.Pd_max / 1000;
+                min_N_ten = (-sec.fy * sec.Ast_total - (sec.fya * sec.A_steel if sec.has_steel else 0)) * 0.9 / 1000
 
+                for title, plot_N, col in eval_N_list:
+                    safe_N = plot_N
+                    if plot_N >= max_N_des: safe_N = max_N_des - 1e-3
+                    if plot_N <= min_N_ten: safe_N = min_N_ten + 1e-3
 
-                    def extract_2d_slice(alpha_deg):
-                        idx_pos = int((alpha_deg / 360.0) * 36);
-                        idx_neg = int(((alpha_deg + 180) / 360.0) * 36) % 36
-                        Mres_n_nom = np.sqrt(Mnx_mesh[:, idx_neg] ** 2 + Mny_mesh[:, idx_neg] ** 2) * -1
-                        Mres_p_nom = np.sqrt(Mnx_mesh[:, idx_pos] ** 2 + Mny_mesh[:, idx_pos] ** 2)
-                        Mres_n_des = np.sqrt(Mdx_mesh[:, idx_neg] ** 2 + Mdy_mesh[:, idx_neg] ** 2) * -1
-                        Mres_p_des = np.sqrt(Mdx_mesh[:, idx_pos] ** 2 + Mdy_mesh[:, idx_pos] ** 2)
-                        return (np.concatenate([Mres_n_nom[::-1], Mres_p_nom]),
-                                np.concatenate([Pn_mesh[:, idx_neg][::-1], Pn_mesh[:, idx_pos]]),
-                                np.concatenate([Mres_n_des[::-1], Mres_p_des]),
-                                np.concatenate([Pd_mesh[:, idx_neg][::-1], Pd_mesh[:, idx_pos]]))
+                    mx_nom, my_nom = extract_mx_my_contour(safe_N, Pn_mesh, Mnx_mesh, Mny_mesh)
+                    mx_des, my_des = extract_mx_my_contour(safe_N, Pd_mesh, Mdx_mesh, Mdy_mesh)
 
+                    fig_c, ax_c = plt.subplots(figsize=(6, 6))
+                    ax_c.plot(mx_nom, my_nom, 'c-.', label=f'Nominal ($P_n = {plot_N:.1f}$ kN)')
+                    ax_c.plot(mx_des, my_des, 'r-', linewidth=2.5, label=f'Design ($P_d = {plot_N:.1f}$ kN)')
 
-                    for col, ang, title, m_col in zip([col_s1, col_s2, col_s3], [0, 90, custom_alpha],
-                                                      ['Slice @ 0° (P-Mx)', 'Slice @ 90° (P-My)',
-                                                       f'Slice @ {custom_alpha}° (P-M$\\alpha$)'],
-                                                      ['Mx', 'My', None]):
-                        with col:
-                            fig_sl = plt.figure(figsize=(6, 5))
-                            ax_sl = fig_sl.add_subplot(111)
-                            M_nom, P_nom, M_des, P_des = extract_2d_slice(ang)
-                            ax_sl.plot(M_nom, P_nom, 'c-.', linewidth=2, label='Nominal')
-                            ax_sl.plot(M_des, P_des, 'r-', linewidth=2, label='Design')
+                    nearby_demands = df_demands[np.abs(df_demands['P'] - plot_N) < 50.0]
+                    if not nearby_demands.empty:
+                        ax_c.scatter(nearby_demands['Mx'], nearby_demands['My'], color='black', marker='x', s=80,
+                                     label='Demands')
+                        max_contour_dc = max([calc_contour_dc(row['Mx'], row['My'], mx_des, my_des) for _, row in
+                                              nearby_demands.iterrows()])
+                        ax_c.set_title(f"{title}: {plot_N:.1f} kN\nMax D/C = {max_contour_dc:.2f}", fontsize=12,
+                                       color='red' if max_contour_dc > 1 else 'green')
+                    else:
+                        ax_c.set_title(f"{title}: {plot_N:.1f} kN\n(No points nearby)", fontsize=12)
 
-                            if m_col == 'Mx':
-                                ax_sl.scatter(df_demands['Mx'], df_demands['P'], color='black', s=25, marker='x',
-                                              zorder=5)
-                            elif m_col == 'My':
-                                ax_sl.scatter(df_demands['My'], df_demands['P'], color='black', s=25, marker='x',
-                                              zorder=5)
-                            else:
-                                a_rad = np.radians(custom_alpha)
-                                m_proj = df_demands['Mx'] * np.cos(a_rad) + df_demands['My'] * np.sin(a_rad)
-                                ax_sl.scatter(m_proj, df_demands['P'], color='black', s=25, marker='x', zorder=5)
+                    ax_c.axhline(0, color='k', linewidth=0.5);
+                    ax_c.axvline(0, color='k', linewidth=0.5)
+                    ax_c.grid(True, linestyle=':', alpha=0.5);
+                    ax_c.set_aspect('equal', adjustable='datalim');
+                    ax_c.legend(loc='upper right')
+                    with col:
+                        st.pyplot(fig_c)
 
-                            ax_sl.axhline(0, color='k', linewidth=0.8);
-                            ax_sl.axvline(0, color='k', linewidth=0.8)
-                            ax_sl.axhline(sec.Po / 1000, color='cyan', linestyle=':', alpha=0.6);
-                            ax_sl.axhline(sec.Pd_max / 1000, color='red', linestyle=':', alpha=0.6)
-                            ax_sl.set_title(title, fontsize=12);
-                            ax_sl.set_xlabel('Moment (kN·m)');
-                            ax_sl.set_ylabel('Axial (kN)')
-                            ax_sl.grid(True, linestyle=':', alpha=0.7);
-                            ax_sl.legend(fontsize=9)
-                            st.pyplot(fig_sl)
+            with tab3:
+                st.subheader("📋 Bresler 倒数公式与综合设计报表")
+                st.markdown("基于 ACI 318 的 **Bresler Reciprocal Method** 经验校核。")
+                st.latex(r"\frac{1}{P_{ni}} = \frac{1}{P_{nx}} + \frac{1}{P_{ny}} - \frac{1}{P_{o}}")
 
-                with tab2:
-                    st.subheader("🎯 恒定轴力 Mx-My 等高线切片 (Constant Load Contour)")
-                    st.write("利用水平截面截取 3D 曲面，得到在指定轴向力 $P_u$ 下的双向抗弯闭合曲线。")
-                    col_p1, col_p2, col_p3 = st.columns(3)
-                    eval_N_list = [("User Input N", target_N, col_p1), ("Max N in Demands", max_N_val, col_p2),
-                                   ("Min N in Demands", min_N_val, col_p3)]
-                    max_N_des = sec.Pd_max / 1000;
-                    min_N_ten = (-sec.fy * sec.Ast_total - (sec.fya * sec.A_steel if has_steel else 0)) * 0.9 / 1000
+                df_demands['D/C (Bresler)'] = df_demands.apply(
+                    lambda row: calc_bresler_dc(row['P'], row['Mx'], row['My'], sec.Pd_max / 1000, Pd_x, Mdx_x,
+                                                Pd_y, Mdy_y), axis=1)
 
-                    for title, plot_N, col in eval_N_list:
-                        safe_N = plot_N
-                        if plot_N >= max_N_des: safe_N = max_N_des - 1e-3
-                        if plot_N <= min_N_ten: safe_N = min_N_ten + 1e-3
+                st.dataframe(df_demands.style.format({
+                    'P': '{:.1f}', 'Mx': '{:.1f}', 'My': '{:.1f}', 'Vx': '{:.1f}', 'Vy': '{:.1f}', 'Tu': '{:.1f}',
+                    'D/C (3D Radial)': '{:.3f}', 'Req_Len': '{:.1f}', 'Cap_Len': '{:.1f}', 'D/C (Bresler)': '{:.3f}'
+                }).background_gradient(subset=['D/C (3D Radial)'], cmap='Reds', vmin=0.5, vmax=1.2),
+                             use_container_width=True)
 
-                        mx_nom, my_nom = extract_mx_my_contour(safe_N, Pn_mesh, Mnx_mesh, Mny_mesh)
-                        mx_des, my_des = extract_mx_my_contour(safe_N, Pd_mesh, Mdx_mesh, Mdy_mesh)
+            with tab4:
+                st.subheader("🗄️ PMM 曲面空间数据输出")
+                st.markdown("以下为系统积分生成的完整 3D 空间曲面包络面离散节点数据。")
 
-                        fig_c, ax_c = plt.subplots(figsize=(6, 6))
-                        ax_c.plot(mx_nom, my_nom, 'c-.', label=f'Nominal ($P_n = {plot_N:.1f}$ kN)')
-                        ax_c.plot(mx_des, my_des, 'r-', linewidth=2.5, label=f'Design ($P_d = {plot_N:.1f}$ kN)')
+                # 数据整理
+                surface_data_list = []
+                for j, alpha in enumerate(alpha_angles):
+                    alpha_deg = int(round(np.degrees(alpha)))
+                    if alpha_deg >= 360: alpha_deg = 360
+                    for i in range(Pn_mesh.shape[0]):
+                        surface_data_list.append({
+                            "Alpha 角 (°)": alpha_deg,
+                            "c (mm)": c_values[i],
+                            "名义轴力 Pn (kN)": Pn_mesh[i, j],
+                            "名义弯矩 Mnx (kN·m)": Mnx_mesh[i, j],
+                            "名义弯矩 Mny (kN·m)": Mny_mesh[i, j],
+                            "设计轴力 Pd (kN)": Pd_mesh[i, j],
+                            "设计弯矩 Mdx (kN·m)": Mdx_mesh[i, j],
+                            "设计弯矩 Mdy (kN·m)": Mdy_mesh[i, j]
+                        })
+                df_surface_full = pd.DataFrame(surface_data_list)
 
-                        nearby_demands = df_demands[np.abs(df_demands['P'] - plot_N) < 50.0]
-                        if not nearby_demands.empty:
-                            ax_c.scatter(nearby_demands['Mx'], nearby_demands['My'], color='black', marker='x', s=80,
-                                         label='Demands')
-                            max_contour_dc = max([calc_contour_dc(row['Mx'], row['My'], mx_des, my_des) for _, row in
-                                                  nearby_demands.iterrows()])
-                            ax_c.set_title(f"{title}: {plot_N:.1f} kN\nMax D/C = {max_contour_dc:.2f}", fontsize=12,
-                                           color='red' if max_contour_dc > 1 else 'green')
-                        else:
-                            ax_c.set_title(f"{title}: {plot_N:.1f} kN\n(No points nearby)", fontsize=12)
+                # 交互式筛选
+                col_f1, col_f2 = st.columns([1, 2])
+                with col_f1:
+                    # 仅展示 0-180 度作为主选，因为 180-360 是其对称面
+                    alpha_options = sorted([a for a in df_surface_full['Alpha 角 (°)'].unique() if a < 180])
+                    selected_alpha = st.selectbox("选择 Alpha 角以查看完整 P-M 曲线",
+                                                  options=alpha_options)
+                
+                # 获取该角度及其 180 度对侧的数据
+                opposite_alpha = (selected_alpha + 180) % 360
+                df_pos = df_surface_full[df_surface_full['Alpha 角 (°)'] == selected_alpha].sort_values('名义轴力 Pn (kN)')
+                df_neg = df_surface_full[df_surface_full['Alpha 角 (°)'] == opposite_alpha].sort_values('名义轴力 Pn (kN)')
+                
+                with col_f2:
+                    st.download_button(
+                        label="📥 下载完整 PMM 曲面 CSV 数据",
+                        data=df_surface_full.to_csv(index=False).encode('utf-8-sig'),
+                        file_name=f'PMM_Surface_Data_{sec.sec_type}.csv',
+                        mime='text/csv',
+                    )
 
-                        ax_c.axhline(0, color='k', linewidth=0.5);
-                        ax_c.axvline(0, color='k', linewidth=0.5)
-                        ax_c.grid(True, linestyle=':', alpha=0.5);
-                        ax_c.set_aspect('equal', adjustable='datalim');
-                        ax_c.legend(loc='upper right')
-                        with col:
-                            st.pyplot(fig_c)
+                st.markdown(f"**Alpha = {selected_alpha}° / {opposite_alpha}° 的完整封闭 P-M 曲线数据**")
+                
+                # 辅助可视化：所选角度的完整封闭 P-M 曲线
+                fig_sub, ax_sub = plt.subplots(figsize=(10, 6))
+                
+                # 计算合弯矩，对侧取负值
+                m_pos_nom = np.sqrt(df_pos['名义弯矩 Mnx (kN·m)']**2 + df_pos['名义弯矩 Mny (kN·m)']**2)
+                m_neg_nom = -np.sqrt(df_neg['名义弯矩 Mnx (kN·m)']**2 + df_neg['名义弯矩 Mny (kN·m)']**2)
+                m_pos_des = np.sqrt(df_pos['设计弯矩 Mdx (kN·m)']**2 + df_pos['设计弯矩 Mdy (kN·m)']**2)
+                m_neg_des = -np.sqrt(df_neg['设计弯矩 Mdx (kN·m)']**2 + df_neg['设计弯矩 Mdy (kN·m)']**2)
+                
+                # 拼接曲线
+                ax_sub.plot(m_pos_nom, df_pos['名义轴力 Pn (kN)'], 'c-.', label='Nominal (Pos)')
+                ax_sub.plot(m_neg_nom, df_neg['名义轴力 Pn (kN)'], 'c-.', label='Nominal (Neg)')
+                ax_sub.plot(m_pos_des, df_pos['设计轴力 Pd (kN)'], 'r-', linewidth=2, label='Design (Pos)')
+                ax_sub.plot(m_neg_des, df_neg['设计轴力 Pd (kN)'], 'r-', linewidth=2, label='Design (Neg)')
+                
+                ax_sub.set_xlabel('Resultant Moment (kN·m)'); ax_sub.set_ylabel('Axial Load (kN)')
+                ax_sub.set_title(f'Full Closed P-M Interaction Diagram at Alpha = {selected_alpha}°')
+                ax_sub.axhline(0, color='k', linewidth=0.8); ax_sub.axvline(0, color='k', linewidth=0.8)
+                ax_sub.grid(True, linestyle=':', alpha=0.6); ax_sub.legend()
+                st.pyplot(fig_sub)
+                
+                st.dataframe(df_pos.style.format(precision=1), use_container_width=True, hide_index=True)
 
-                with tab3:
-                    st.subheader("📋 Bresler 倒数公式与综合设计报表")
-                    st.markdown("基于 ACI 318 的 **Bresler Reciprocal Method** 经验校核。")
-                    st.latex(r"\frac{1}{P_{ni}} = \frac{1}{P_{nx}} + \frac{1}{P_{ny}} - \frac{1}{P_{o}}")
+            with tab5:
+                st.subheader("📄 构件计算书输出 (Report)")
+                st.info("计算书生成模块正在建设中。后续将根据具体的工程文档格式排版并导出 PDF/Word 详单。")
 
-                    _, _, Pd_x, Mdx_x = compute_2d_pm_strict(sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top),
-                                                             int(n_bot), int(n_side), int(n_circ), d_bar, has_steel, hs,
-                                                             bs, tw, tf, fya, 'fiber', 'X')
-                    _, _, Pd_y, Mdy_y = compute_2d_pm_strict(sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top),
-                                                             int(n_bot), int(n_side), int(n_circ), d_bar, has_steel, hs,
-                                                             bs, tw, tf, fya, 'fiber', 'Y')
-                    df_demands['D/C (Bresler)'] = df_demands.apply(
-                        lambda row: calc_bresler_dc(row['P'], row['Mx'], row['My'], sec.Pd_max / 1000, Pd_x, Mdx_x,
-                                                    Pd_y, Mdy_y), axis=1)
+        else:
+            Pn_x, Mn_x, Pd_x, Md_x = res['Pn_x'], res['Mn_x'], res['Pd_x'], res['Md_x']
+            Pn_y, Mn_y, Pd_y, Md_y = res['Pn_y'], res['Mn_y'], res['Pd_y'], res['Md_y']
+            method = res['method']
 
-                    st.dataframe(df_demands.style.format({
-                        'P': '{:.1f}', 'Mx': '{:.1f}', 'My': '{:.1f}', 'Vx': '{:.1f}', 'Vy': '{:.1f}', 'Tu': '{:.1f}',
-                        'D/C (3D Radial)': '{:.3f}', 'Req_Len': '{:.1f}', 'Cap_Len': '{:.1f}', 'D/C (Bresler)': '{:.3f}'
-                    }).background_gradient(subset=['D/C (3D Radial)'], cmap='Reds', vmin=0.5, vmax=1.2),
-                                 use_container_width=True)
+            fig_2d, (ax_x, ax_y) = plt.subplots(1, 2, figsize=(14, 6))
 
-                with tab4:
-                    st.subheader("🗄️ PMM 曲面空间数据输出")
-                    st.markdown("以下为系统积分生成的完整 3D 空间曲面包络面离散节点数据。")
+            ax_x.plot(Mn_x, Pn_x, 'c-.', label='Nominal')
+            ax_x.plot(Md_x, Pd_x, 'r-', linewidth=2.5, label='Design')
+            ax_x.scatter(df_demands['Mx'], df_demands['P'], color='black', s=40, marker='x', label='Demands')
+            ax_x.set_title(f'P-Mx (0°) Bending\nMethod: {method}', fontsize=12)
 
-                    surface_data = []
-                    for j, alpha in enumerate(alpha_angles):
-                        alpha_deg = np.degrees(alpha)
-                        for i in range(Pn_mesh.shape[0]):
-                            surface_data.append({
-                                "Alpha 角 (°)": alpha_deg,
-                                "名义轴力 Pn (kN)": Pn_mesh[i, j],
-                                "名义弯矩 Mnx (kN·m)": Mnx_mesh[i, j],
-                                "名义弯矩 Mny (kN·m)": Mny_mesh[i, j],
-                                "设计轴力 Pd (kN)": Pd_mesh[i, j],
-                                "设计弯矩 Mdx (kN·m)": Mdx_mesh[i, j],
-                                "设计弯矩 Mdy (kN·m)": Mdy_mesh[i, j]
-                            })
-                    df_surface = pd.DataFrame(surface_data)
-                    st.dataframe(df_surface.style.format(precision=1), use_container_width=True)
+            ax_y.plot(Mn_y, Pn_y, 'c-.', label='Nominal')
+            ax_y.plot(Md_y, Pd_y, 'r-', linewidth=2.5, label='Design')
+            ax_y.scatter(df_demands['My'], df_demands['P'], color='black', s=40, marker='x', label='Demands')
+            ax_y.set_title(f'P-My (90°) Bending\nMethod: {method}', fontsize=12)
 
-                with tab5:
-                    st.subheader("📄 构件计算书输出 (Report)")
-                    st.info("计算书生成模块正在建设中。后续将根据具体的工程文档格式排版并导出 PDF/Word 详单。")
+            for ax in (ax_x, ax_y):
+             ax.axhline(0, color='k', linewidth=0.8);
+             ax.axvline(0, color='k', linewidth=0.8)
+             ax.set_xlabel('Moment (kN·m)');
+             ax.set_ylabel('Axial Load (kN)')
+             ax.grid(True, linestyle=':', alpha=0.7);
+             ax.legend()
 
-            else:
-                method = 'stress_block' if '等效应力块' in engine_mode else 'fiber'
-                Pn_x, Mn_x, Pd_x, Md_x = compute_2d_pm_strict(
-                  sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top), int(n_bot), int(n_side), int(n_circ),
-                  d_bar, has_steel, hs, bs, tw, tf, fya, method, bending_axis='X')
-                Pn_y, Mn_y, Pd_y, Md_y = compute_2d_pm_strict(
-                  sec.sec_type, b, h, D, fc, fy, 200000.0, cover, int(n_top), int(n_bot), int(n_side), int(n_circ),
-                  d_bar, has_steel, hs, bs, tw, tf, fya, method, bending_axis='Y')
-
-                fig_2d, (ax_x, ax_y) = plt.subplots(1, 2, figsize=(14, 6))
-
-                ax_x.plot(Mn_x, Pn_x, 'c-.', label='Nominal')
-                ax_x.plot(Md_x, Pd_x, 'r-', linewidth=2.5, label='Design')
-                ax_x.scatter(df_demands['Mx'], df_demands['P'], color='black', s=40, marker='x', label='Demands')
-                ax_x.set_title(f'P-Mx (0°) Bending\nMethod: {method}', fontsize=12)
-
-                ax_y.plot(Mn_y, Pn_y, 'c-.', label='Nominal')
-                ax_y.plot(Md_y, Pd_y, 'r-', linewidth=2.5, label='Design')
-                ax_y.scatter(df_demands['My'], df_demands['P'], color='black', s=40, marker='x', label='Demands')
-                ax_y.set_title(f'P-My (90°) Bending\nMethod: {method}', fontsize=12)
-
-                for ax in (ax_x, ax_y):
-                 ax.axhline(0, color='k', linewidth=0.8);
-                 ax.axvline(0, color='k', linewidth=0.8)
-                 ax.set_xlabel('Moment (kN·m)');
-                 ax.set_ylabel('Axial Load (kN)')
-                 ax.grid(True, linestyle=':', alpha=0.7);
-                 ax.legend()
-
-                 st.pyplot(fig_2d)
+             st.pyplot(fig_2d)
 
 else:
     st.info("👈 请在侧边栏配置各项参数及输入设计内力，然后点击 **开始分析与验算**。")

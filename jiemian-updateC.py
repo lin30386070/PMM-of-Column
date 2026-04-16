@@ -79,6 +79,10 @@ class RCSection:
 
         self.has_steel = has_steel
         self.fya = float(fya)
+        self.hs = float(hs) if has_steel else 0.0
+        self.bs = float(bs) if has_steel else 0.0
+        self.tw = float(tw) if has_steel else 0.0
+        self.tf = float(tf) if has_steel else 0.0
         s_xs, s_ys, s_As = [], [], []
 
         if has_steel:
